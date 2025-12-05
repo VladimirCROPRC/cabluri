@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="ro">
+<head>
+  <meta charset="utf-8">
+  <title>Client ↔ Site — Cablare (KMZ share)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+
+  <!-- Leaflet CSS -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <!-- Leaflet.draw CSS -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.css" />
+  <!-- JSZip (pentru KMZ=ZIP cu doc.kml) -->
+  <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+
+  <style>
+    body { margin:0; font-family:system-ui, Segoe UI, Roboto, Arial; }
+    header { padding:10px 14px; border-bottom:1px solid #e5e5e5; background:#fafafa; }
+    h2 { margin:0; }
+    .toolbar { padding:10px 14px; display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+    .btn { padding:8px 12px; border:1px solid #c9c9c9; border-radius:6px; background:#fff; cursor:pointer; }
+    .btn.primary { background:#0066ff; color:#fff; border-color:#0057da; }
+    .note { font-size:12px; color:#555; }
+    #map { height: calc(100vh - 180px); min-height: 420px; }
+    #len { font-weight:600; }
+    .box { padding:8px 12px; border-top:1px solid #eee; background:#fafafa; }
+  </style>
+</head>
+<body>
+  <header>
+    <h2>Client ↔ Site — traseu cablu (KMZ atașat la mail)</h2>
+    <div class="note">
+      Desenează polyline-ul cablului și apasă <b>Trimite KMZ</b> — pe mobil va deschide aplicația de e‑mail cu fișierul <b>KMZ atașat</b>.
+      
+    </div>
+  </header>
+
+  <div class="toolbar">
+    <button id="gpsClient" class="btn">📍 Client din GPS</button>
+    <button id="markClient" class="btn">➕ Marchează client (click pe hartă)</button>
+    <button id="markSite" class="btn">➕ Marchează site (click pe hartă)</button>
+    <button id="drawCable" class="btn primary">🧵 Desenează cablu</button>
+    <button id="clearCable" class="btn">🧹 Șterge cablu</button>
+    <button id="sendKmz" class="btn">✉️ Trimite KMZ</button>
+    <button id="downloadKmz" class="btn">⬇️ Descarcă KMZ</button>
+    <span class="note">Lungime totală: <span id="len">0 m</span></span>
+  </div>
+
+  <div id="map"></div>
+  <div class="box note" id="info"></div>
+
+  <!-- Leaflet JS -->
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <!-- Leaflet.draw JS -->
+  <script src="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js"></script>
+
+  <script>
+    // ===== Harta de bază =====
+    const map = L.map('map').setView([46.77, 23.59], 12); // Cluj-Napoca
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 19, attribution: '&copy; OpenStreetMap contributors'
+    }).addTo(map);
+
+    const cableLayer  = L.featureGroup().addTo(map); // polylines
+    const pointsLayer = L.featureGroup().addTo(map); // client/site markers
+
+    let clientMarker = null;
+    let siteMarker   = null;
+    let cable        = null;
+
+    const lenEl  = document.getElementById('len');
+    const infoEl = document.getElementById('info');
+
+    // ===== Utilitare =====
+    const fmtLen = (m) => m < 1000 ? `${m.toFixed(1)} m` : `${(m/1000).toFixed(3)} km`;
+    const dist = (A, B) => haversine(A[0], A[1], B[0], B[1]);
+    function haversine(lat1, lon1, lat2, lon2) {
+      const R = 6371000, toRad = d=>d*Math.PI/180;
+      const dLat = toRad(lat2 - lat1), dLon = toRad(lon2 - lon1);
+      const a = Math.sin(dLat/2)**2 + Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLon/2)**2;
+      return 2 * R * Math.asin(Math.sqrt(a));
+    }
+    function updateLen() {
+      if (!cable) { lenEl.textContent = '0 m'; infoEl.textContent = ''; return; }
+      const latlngs = cable.getLatLngs();
+      let total = 0;
+      for (let i=1; i<latlngs.length; i++) total += dist([latlngs[i-1].lat, latlngs[i-1].lng], [latlngs[i].lat, latlngs[i].lng]);
+      lenEl.textContent = fmtLen(total);
+      infoEl.textContent = `Puncte cablu: ${latlngs.length} | Lungime: ${fmtLen(total)}`;
+    }
+    function setClient(latlng) {
+      if (clientMarker) clientMarker.remove();
+      clientMarker = L.marker(latlng, { draggable:true }).addTo(pointsLayer)
+        .bindPopup('<b>Client</b>').openPopup();
+      clientMarker.on('dragend', () => { if (cable) snapEndPoints(); updateLen(); });
+    }
+    function setSite(latlng) {
+      if (siteMarker) siteMarker.remove();
+      siteMarker = L.marker(latlng, { draggable:true, icon: L.divIcon({
+        className:'', html:'<div style="width:18px;height:18px;border-radius:50%;background:#0066ff;border:2px solid #003ea3;"></div>'
+      })}).addTo(pointsLayer).bindPopup('<b>Site</b>').openPopup();
+      siteMarker.on('dragend', () => { if (cable) snapEndPoints(); updateLen(); });
+    }
+    function snapEndPoints() {
+      if (!cable || !clientMarker || !siteMarker) return;
+      const latlngs = cable.getLatLngs();
+      if (!latlngs.length) return;
+      latlngs[0] = clientMarker.getLatLng();
+      latlngs[latlngs.length-1] = siteMarker.getLatLng();
+      cable.setLatLngs(latlngs);
+    }
+
+    // ===== Controale UI =====
+    const gpsBtn     = document.getElementById('gpsClient');
+    const markClient = document.getElementById('markClient');
+    const markSite   = document.getElementById('markSite');
+    const drawBtn    = document.getElementById('drawCable');
+    const clearBtn   = document.getElementById('clearCable');
+    const sendKmzBtn = document.getElementById('sendKmz');
+    const dlKmzBtn   = document.getElementById('downloadKmz');
+
+    gpsBtn.addEventListener('click', () => {
+      if (!navigator.geolocation) return alert('Geolocația nu este suportată.');
+      navigator.geolocation.getCurrentPosition(pos => {
+        const ll = [pos.coords.latitude, pos.coords.longitude];
+        setClient(ll); map.setView(ll, 16);
+      }, err => alert('Eroare GPS: ' + err.message), { enableHighAccuracy:true, timeout:15000 });
+    });
+
+    let awaiting = null;
+    markClient.addEventListener('click', () => { awaiting = 'client'; alert('Click pe hartă pentru CLIENT.'); });
+    markSite.addEventListener('click', () => { awaiting = 'site'; alert('Click pe hartă pentru SITE.'); });
+    map.on('click', (e) => {
+      if (awaiting === 'client') { setClient(e.latlng); awaiting = null; }
+      else if (awaiting === 'site') { setSite(e.latlng); awaiting = null; }
+    });
+
+    drawBtn.addEventListener('click', () => {
+      if (cable) { alert('Cablul există deja. Editează punctele (drag).'); return; }
+      const start = clientMarker ? clientMarker.getLatLng() : map.getCenter();
+      const end   = siteMarker   ? siteMarker.getLatLng()   : map.getCenter();
+      cable = L.polyline([start, end], { color:'#d0011b', weight:4 }).addTo(cableLayer);
+      enableVertexEditing();
+      updateLen();
+    });
+
+    function enableVertexEditing() {
+      const drawControl = new L.Control.Draw({
+        edit: { featureGroup: cableLayer, poly: { allowIntersection:true } },
+        draw: { polyline:true, polygon:false, rectangle:false, circle:false, marker:false, circlemarker:false }
+      });
+      map.addControl(drawControl);
+      map.on(L.Draw.Event.CREATED, (e) => {
+        if (e.layer instanceof L.Polyline) {
+          if (cable) cable.remove();
+          cable = e.layer.addTo(cableLayer);
+          snapEndPoints(); updateLen();
+        }
+      });
+      map.on(L.Draw.Event.EDITED, () => { snapEndPoints(); updateLen(); });
+    }
+
+    clearBtn.addEventListener('click', () => {
+      cableLayer.clearLayers(); cable = null; lenEl.textContent = '0 m'; infoEl.textContent = '';
+    });
+
+    // ===== Generare KML & KMZ =====
+    function toKML(poly) {
+      const coords = poly.getLatLngs().map(p => `${p.lng},${p.lat},0`).join(' ');
+      return `<?xml version="1.0" encoding="UTF-8"?>
+`+
+`<kml xmlns="http://www.opengis.net/kml/2.2"><Document><name>Cablu Client–Site</name>
+`+
+`<Placemark><name>Cablu</name><Style><LineStyle><color>ff1b01d0</color><width>4</width></LineStyle></Style>
+`+
+`<LineString><tessellate>1</tessellate><coordinates>${coords}</coordinates></LineString></Placemark>
+`+
+`</Document></kml>`;
+    }
+
+    async function buildKMZ(filename='cablu_client_site.kmz') {
+      if (!cable) throw new Error('Nu există cablu desenat.');
+      const kml = toKML(cable);
+      const zip = new JSZip();
+      zip.file('doc.kml', kml);
+      const blob = await zip.generateAsync({ type: 'blob', compression: 'STORE' });
+      const kmzBlob = new Blob([blob], { type: 'application/vnd.google-earth.kmz' });
+      return new File([kmzBlob], filename, { type: 'application/vnd.google-earth.kmz' });
+    }
+
+    // ===== Trimite KMZ (Web Share API) sau fallback =====
+    sendKmzBtn.addEventListener('click', async () => {
+      try {
+        const file = await buildKMZ('cablu_client_site.kmz');
+        if (navigator.canShare && navigator.canShare({ files: [file] })) {
+          await navigator.share({
+            title: 'Cablu Client–Site',
+            text: 'KMZ atașat: traseu cablu Client ↔ Site.',
+            files: [file]
+          });
+        } else {
+          downloadFile(file);
+          const to = 'coordonare@proconect.ro';
+          const subject = encodeURIComponent('Cablu Client↔Site (KMZ atașat manual)');
+          const body = encodeURIComponent('Am generat KMZ-ul și l-am descărcat. Îl atașez manual la acest e-mail.');
+          window.location.href = `mailto:${to}?subject=${subject}&body=${body}`;
+          alert('Dispozitivul nu suportă share cu fișiere. KMZ a fost descărcat — atașează-l manual în e-mail.');
+        }
+      } catch (err) {
+        alert('Nu pot genera/trimite KMZ: ' + err.message);
+      }
+    });
+
+    dlKmzBtn.addEventListener('click', async () => {
+      try {
+        const file = await buildKMZ('cablu_client_site.kmz');
+        downloadFile(file);
+      } catch (err) {
+        alert('Nu pot genera KMZ: ' + err.message);
+      }
+    });
+
+    function downloadFile(file) {
+      const url = URL.createObjectURL(file);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = file.name;
+      document.body.appendChild(a); a.click();
+      setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 500);
+    }
+  </script>
+</body>
+</html>
